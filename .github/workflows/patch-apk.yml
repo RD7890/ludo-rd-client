@@ -72,7 +72,7 @@ jobs:
 
       - name: Decode APK
         run: |
-          apktool decode original.apk -o decoded_apk --no-res -f
+          apktool decode original.apk -o decoded_apk -f
           echo "Decoded files:"
           ls decoded_apk/
 
