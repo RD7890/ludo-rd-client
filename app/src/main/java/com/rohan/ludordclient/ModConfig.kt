@@ -9,8 +9,7 @@ object ModConfig {
     var speedMultiplier: Int = 1
 
     fun saveToPrefs(context: Context) {
-        @Suppress("DEPRECATION")
-        val prefs = context.getSharedPreferences("ludo_mods", Context.MODE_WORLD_READABLE)
+        val prefs = context.getSharedPreferences("ludo_mods", Context.MODE_PRIVATE)
         prefs.edit().apply {
             putBoolean("red_always_wins", redAlwaysWins)
             putInt("force_dice", forceDice)
