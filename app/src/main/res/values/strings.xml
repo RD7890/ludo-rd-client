@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ludo RD Client</string>
+    <string name="launch_button">LAUNCH LUDO RD</string>
+    <string name="status_connecting">● Connecting...</string>
+    <string name="status_connected">● Connected (Live Mode)</string>
+    <string name="status_offline">● Offline (Config Mode)</string>
+    <string name="game_not_installed">Game not installed!</string>
+</resources>

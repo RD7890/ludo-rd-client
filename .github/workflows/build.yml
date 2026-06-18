@@ -1,0 +1,105 @@
+name: Build Ludo RD Client
+
+on:
+  push:
+    branches:
+      - "main"
+      - "dev"
+      - "release/**"
+    paths-ignore:
+      - '**.md'
+      - '**.json'
+      - '.github/workflows/crowdin_contributors.yml'
+  pull_request:
+    branches: [ "dev" ]
+    paths-ignore:
+      - '**.md'
+      - '**.json'
+  workflow_dispatch: { }
+
+permissions:
+  contents: write
+
+jobs:
+  build_release_apk:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel previous runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+
+      - name: Change Gradle wrapper permissions
+        run: chmod +x ./gradlew
+
+      - name: Restore Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-v2-${{ hashFiles('**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Generate signing keystore
+        run: |
+          mkdir -p app/signing
+          keytool -genkeypair \
+            -alias ludord \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -keystore app/signing/signing-key.jks \
+            -storepass ludord123 \
+            -keypass ludord123 \
+            -dname "CN=LudoRD, OU=Dev, O=RD, L=Unknown, S=Unknown, C=US"
+
+      - name: Create local.properties
+        run: |
+          echo "signing.storeFile=signing/signing-key.jks" >> local.properties
+          echo "signing.storePassword=ludord123"           >> local.properties
+          echo "signing.keyAlias=ludord"                   >> local.properties
+          echo "signing.keyPassword=ludord123"             >> local.properties
+
+      - name: Assemble Release APK
+        env:
+          SIGNING_STORE_PASSWORD: "ludord123"
+          SIGNING_KEY_PASSWORD: "ludord123"
+        run: ./gradlew :app:assembleRelease
+
+      - name: Get version name
+        id: version
+        run: |
+          VERSION=$(grep -m1 versionName app/build.gradle | awk -F'"' '{print $2}')
+          echo "name=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.name }}-build.${{ github.run_number }}
+          name: "v${{ steps.version.outputs.name }} (Build #${{ github.run_number }})"
+          body: |
+            **Automated release build — Ludo RD Client**
+            - Branch: `${{ github.ref_name }}`
+            - Commit: `${{ github.sha }}`
+            - Run: #${{ github.run_number }}
+          draft: false
+          prerelease: true
+          files: |
+            app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
