@@ -43,12 +43,11 @@ jobs:
           unzip -q /tmp/ndk.zip -d /opt
           echo "NDK_HOME=/opt/android-ndk-r27c" >> $GITHUB_ENV
 
-      - name: Download Zygisk API header
+      - name: Verify Zygisk header
         run: |
-          mkdir -p hook/src
-          curl -sL https://raw.githubusercontent.com/topjohnwu/zygisk-api/master/zygisk.hpp \
-            -o hook/src/zygisk.hpp
-          echo "Zygisk header: $(wc -l < hook/src/zygisk.hpp) lines"
+          LINES=$(wc -l < hook/src/zygisk.hpp)
+          echo "zygisk.hpp: $LINES lines (bundled in repo)"
+          [ "$LINES" -gt 100 ] || { echo "❌ Missing zygisk.hpp"; exit 1; }
 
       - name: Build arm64-v8a hook .so
         run: |
