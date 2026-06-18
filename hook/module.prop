@@ -1,0 +1,6 @@
+id=ludo-rd-hook
+name=Ludo RD Hook
+version=v1.0
+versionCode=1
+author=RD7890
+description=Zygisk module that hooks UnityEngine.Random.RandomRangeInt inside com.ludo.king to force dice values. Requires Magisk + Zygisk enabled.

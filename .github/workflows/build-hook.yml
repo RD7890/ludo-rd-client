@@ -1,0 +1,113 @@
+name: Build Zygisk Hook Module
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+    paths:
+      - 'hook/**'
+      - '.github/workflows/build-hook.yml'
+  workflow_dispatch: { }
+
+permissions:
+  contents: write
+
+jobs:
+  build_hook:
+    name: Build Zygisk ARM64 Hook
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel previous runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+
+      - name: Setup Android NDK r27
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "NDK_PATH=/opt/android-ndk-r27c" >> $GITHUB_ENV
+          echo "/opt/android-ndk-r27c" >> $GITHUB_PATH
+
+      - name: Download Zygisk API header
+        run: |
+          mkdir -p hook/src
+          curl -sL https://raw.githubusercontent.com/topjohnwu/zygisk-api/master/zygisk.hpp \
+            -o hook/src/zygisk.hpp
+          echo "Zygisk header downloaded ($(wc -l < hook/src/zygisk.hpp) lines)"
+
+      - name: Build arm64-v8a hook .so
+        run: |
+          mkdir -p hook/build
+          /opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/cmake \
+            -S hook \
+            -B hook/build \
+            -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk-r27c/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+          /opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/cmake \
+            --build hook/build --config Release
+          echo "Built: $(ls -lh hook/build/libludordhook.so)"
+
+      - name: Package Zygisk module ZIP
+        run: |
+          mkdir -p dist/zygisk/arm64-v8a
+          cp hook/build/libludordhook.so dist/zygisk/arm64-v8a.so
+          cp hook/module.prop            dist/module.prop
+          cp hook/customize.sh           dist/customize.sh
+          cp -r hook/META-INF            dist/META-INF
+          chmod +x dist/META-INF/com/google/android/update-binary
+
+          cd dist
+          zip -r ../LudoRD-Hook-Zygisk.zip . -x "*.DS_Store"
+          cd ..
+          echo "Module ZIP: $(ls -lh LudoRD-Hook-Zygisk.zip)"
+
+      - name: Get APK version
+        id: version
+        run: |
+          VERSION=$(grep -m1 versionName app/build.gradle | awk -F'"' '{print $2}')
+          echo "name=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: hook-v${{ steps.version.outputs.name }}-build.${{ github.run_number }}
+          name: "Zygisk Hook v${{ steps.version.outputs.name }} (Build #${{ github.run_number }})"
+          body: |
+            **Ludo RD Zygisk Hook Module**
+
+            ### What this does
+            Injects into `com.ludo.king` at launch and hooks `UnityEngine.Random.RandomRangeInt`
+            so every dice roll returns your forced value.
+
+            ### Install
+            1. Flash **LudoRD-Hook-Zygisk.zip** in Magisk (Zygisk must be enabled)
+            2. Reboot
+            3. Open **Ludo RD Client**, set your dice value, tap **LAUNCH LUDO RD**
+            4. The hook reads `/sdcard/LudoRD/config.conf` on every dice roll — no relaunch needed
+
+            ### Requirements
+            - Rooted device with **Magisk v24+**
+            - **Zygisk enabled** in Magisk settings
+
+            ---
+            - Branch: `${{ github.ref_name }}`
+            - Commit: `${{ github.sha }}`
+          draft: false
+          prerelease: false
+          files: LudoRD-Hook-Zygisk.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
