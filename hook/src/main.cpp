@@ -4,19 +4,21 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 
 #include "zygisk.hpp"
 
 using namespace zygisk;
 
-#define LOG_TAG  "LudoRDHook"
-#define LOGI(...)  __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...)  __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOG_TAG "LudoRDHook"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ── Config ────────────────────────────────────────────────────────────────────
 #define CONFIG_PATH "/sdcard/LudoRD/config.conf"
@@ -35,6 +37,33 @@ static void readConfig() {
     fclose(f);
 }
 
+// ── Fallback XorShift RNG (replaces original for non-dice calls) ───────────────
+// We can't use a trampoline — ARM64 PC-relative instructions (ADRP/BL)
+// break when re-executed from a different address.  Instead, replicate the
+// int-range logic ourselves so callers still get valid random values.
+static uint64_t g_xorSeed = 0;
+
+static void initSeed() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g_xorSeed = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 32) ^ 0xDEADBEEF12345678ULL;
+    if (g_xorSeed == 0) g_xorSeed = 1;
+}
+
+static uint64_t xorshift64() {
+    uint64_t x = g_xorSeed;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    g_xorSeed = x;
+    return x;
+}
+
+static int randRange(int min, int max) {
+    if (max <= min) return min;
+    return min + (int)(xorshift64() % (uint64_t)(max - min));
+}
+
 // ── IL2CPP minimal types ──────────────────────────────────────────────────────
 struct Il2CppDomain;
 struct Il2CppAssembly;
@@ -42,10 +71,10 @@ struct Il2CppImage;
 struct Il2CppClass;
 
 struct MethodInfo {
-    void*       methodPointer;
-    void*       virtualMethodPointer;
-    void*       invoker_method;
-    const char* name;
+    void*        methodPointer;
+    void*        virtualMethodPointer;
+    void*        invoker_method;
+    const char*  name;
     Il2CppClass* klass;
 };
 
@@ -56,169 +85,129 @@ static Il2CppImage*     (*f_assembly_get_image)(Il2CppAssembly*)                
 static Il2CppClass*     (*f_class_from_name)(Il2CppImage*, const char*, const char*) = nullptr;
 static const MethodInfo*(*f_method_from_name)(Il2CppClass*, const char*, int)        = nullptr;
 
-// ── ARM64 inline hook ─────────────────────────────────────────────────────────
-// We overwrite the first 16 bytes of the target function with:
-//   LDR X16, #8       ; load 8-byte address from pc+8
-//   BR  X16           ; branch to it
-//   .8byte <hook_fn>  ; the absolute address
-
+// ── Patch state ───────────────────────────────────────────────────────────────
 #define PATCH_SIZE 16
 
-struct PatchSite {
-    uint8_t  saved[PATCH_SIZE];   // original bytes (for the trampoline)
-    void*    target;               // pointer to the patched function
-    bool     installed;
-};
+static void*   g_targetInt       = nullptr;  // RandomRangeInt function ptr
+static void*   g_targetFloat     = nullptr;  // Range(float,float) function ptr
+static uint8_t g_patchBytes[PATCH_SIZE];     // the patch we write
 
-// We hook two functions:
-//   slot 0 = UnityEngine.Random.RandomRangeInt(int,int)
-//   slot 1 = UnityEngine.Random.Range(float,float)  (Ludo King also uses this)
-#define NUM_HOOKS 2
-static PatchSite g_sites[NUM_HOOKS];
+// Build the 16-byte ARM64 absolute-branch patch into g_patchBytes targeting hookFn
+static void buildPatch(void* hookFn) {
+    // LDR X16, #8   — load 8-byte address from PC+8
+    g_patchBytes[0] = 0x50; g_patchBytes[1] = 0x00;
+    g_patchBytes[2] = 0x00; g_patchBytes[3] = 0x58;
+    // BR X16
+    g_patchBytes[4] = 0x00; g_patchBytes[5] = 0x02;
+    g_patchBytes[6] = 0x1F; g_patchBytes[7] = 0xD6;
+    // Absolute 64-bit address of our hook
+    uint64_t addr = (uint64_t)(uintptr_t)hookFn;
+    memcpy(g_patchBytes + 8, &addr, 8);
+}
 
-// Trampoline buffers: saved_bytes + absolute-jump back to original+PATCH_SIZE
-// Layout per trampoline (32 bytes):
-//   [0..15]  : original saved bytes
-//   [16..31] : LDR X16, #8 / BR X16 / .8byte (target + PATCH_SIZE)
-static uint8_t g_trampolines[NUM_HOOKS][32] __attribute__((aligned(8)));
-
-// Original function pointers (point into the trampoline so IL2CPP caching is bypassed)
-static int (*g_origRangeInt)(int32_t, int32_t, const MethodInfo*) = nullptr;
-static float (*g_origRangeFloat)(float, float, const MethodInfo*) = nullptr;
-
-// ── Write an absolute branch patch ───────────────────────────────────────────
-static bool writePatch(void* target, void* hookFn) {
-    uintptr_t addr = reinterpret_cast<uintptr_t>(target);
-    uintptr_t page = addr & ~(static_cast<uintptr_t>(getpagesize() - 1));
-    size_t    len  = getpagesize() * 2;
-
-    if (mprotect(reinterpret_cast<void*>(page), len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("mprotect RWX failed for %p: %s", target, strerror(errno));
-        // Try without EXEC (some kernels split W^X)
-        if (mprotect(reinterpret_cast<void*>(page), len, PROT_READ | PROT_WRITE) != 0) {
-            LOGE("mprotect RW also failed: %s", strerror(errno));
-            return false;
-        }
+// ── Write to a code page via /proc/self/mem (bypasses W^X) ───────────────────
+static bool memWrite(void* target, const void* src, size_t len) {
+    int fd = open("/proc/self/mem", O_RDWR);
+    if (fd < 0) {
+        LOGE("open /proc/self/mem failed: %s", strerror(errno));
+        return false;
     }
-
-    uint8_t* p = reinterpret_cast<uint8_t*>(target);
-    // LDR X16, #8  (0x58000050)
-    p[0] = 0x50; p[1] = 0x00; p[2] = 0x00; p[3] = 0x58;
-    // BR X16       (0xD61F0200)
-    p[4] = 0x00; p[5] = 0x02; p[6] = 0x1F; p[7] = 0xD6;
-    // 8-byte absolute address of the hook function
-    uint64_t hAddr = reinterpret_cast<uint64_t>(hookFn);
-    memcpy(p + 8, &hAddr, 8);
-
-    __builtin___clear_cache(reinterpret_cast<char*>(target),
-                            reinterpret_cast<char*>(target) + PATCH_SIZE);
+    off_t off = (off_t)(uintptr_t)target;
+    if (lseek(fd, off, SEEK_SET) != off) {
+        LOGE("lseek to %p failed: %s", target, strerror(errno));
+        close(fd);
+        return false;
+    }
+    ssize_t written = write(fd, src, len);
+    close(fd);
+    if (written != (ssize_t)len) {
+        LOGE("write to %p failed (wrote %zd/%zu): %s", target, written, len, strerror(errno));
+        return false;
+    }
+    __builtin___clear_cache((char*)target, (char*)target + len);
     return true;
 }
 
-// ── Check if our patch is still in place ─────────────────────────────────────
-static bool isPatchIntact(int slot) {
-    if (!g_sites[slot].target || !g_sites[slot].installed) return false;
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(g_sites[slot].target);
-    // Check the LDR X16 opcode bytes
-    return (p[0] == 0x50 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x58 &&
-            p[4] == 0x00 && p[5] == 0x02 && p[6] == 0x1F && p[7] == 0xD6);
+// Check if our patch is still intact at a target address
+static bool isPatchIntact(void* target) {
+    if (!target) return false;
+    const uint8_t* p = (const uint8_t*)target;
+    // Check LDR X16,#8 opcode
+    return p[0] == 0x50 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x58 &&
+           p[4] == 0x00 && p[5] == 0x02 && p[6] == 0x1F && p[7] == 0xD6;
 }
 
-// ── Build trampoline for a slot ───────────────────────────────────────────────
-static void buildTrampoline(int slot, void* target, void* hookFn) {
-    uint8_t* tramp = g_trampolines[slot];
-
-    // First 16 bytes: copy saved original instructions
-    memcpy(tramp, g_sites[slot].saved, PATCH_SIZE);
-
-    // Next 16 bytes: absolute jump back to target + PATCH_SIZE
-    uintptr_t returnAddr = reinterpret_cast<uintptr_t>(target) + PATCH_SIZE;
-    tramp[16] = 0x50; tramp[17] = 0x00; tramp[18] = 0x00; tramp[19] = 0x58; // LDR X16, #8
-    tramp[20] = 0x00; tramp[21] = 0x02; tramp[22] = 0x1F; tramp[23] = 0xD6; // BR X16
-    memcpy(tramp + 24, &returnAddr, 8);
-
-    // Make trampoline executable
-    uintptr_t tp   = reinterpret_cast<uintptr_t>(tramp);
-    uintptr_t tpag = tp & ~(static_cast<uintptr_t>(getpagesize() - 1));
-    mprotect(reinterpret_cast<void*>(tpag), getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC);
-    __builtin___clear_cache(reinterpret_cast<char*>(tramp),
-                            reinterpret_cast<char*>(tramp) + 32);
-}
-
-// ── Install (or re-install) a hook at a slot ─────────────────────────────────
-static bool installHook(int slot, void* target, void* hookFn) {
-    if (!g_sites[slot].installed) {
-        // First install: save original bytes and build trampoline
-        memcpy(g_sites[slot].saved, target, PATCH_SIZE);
-        g_sites[slot].target    = target;
-        buildTrampoline(slot, target, hookFn);
-        g_sites[slot].installed = true;
-        LOGI("[slot %d] First install: target=%p hook=%p trampoline=%p",
-             slot, target, hookFn, g_trampolines[slot]);
-    }
-
-    bool ok = writePatch(target, hookFn);
-    if (ok) LOGI("[slot %d] Patch written OK at %p", slot, target);
-    else    LOGE("[slot %d] Patch FAILED at %p", slot, target);
+static bool applyPatch(void* target) {
+    bool ok = memWrite(target, g_patchBytes, PATCH_SIZE);
+    if (ok) LOGI("Patch applied at %p", target);
+    else    LOGE("Patch FAILED at %p", target);
     return ok;
 }
 
-// ── Hook implementations ──────────────────────────────────────────────────────
-static int hook_RandomRangeInt(int32_t min, int32_t max, const MethodInfo* method) {
+// ── Hook functions ────────────────────────────────────────────────────────────
+// These are the functions the patch branches to.
+// We do NOT call back to the original (trampoline approach is broken for ARM64
+// PC-relative code). For non-dice calls we return our own XorShift random value,
+// which is indistinguishable from Unity's for AI/game-logic purposes.
+
+static int hook_RandomRangeInt(int32_t min, int32_t max, const MethodInfo* /*method*/) {
     readConfig();
-    // Dice: Unity calls RandomRangeInt(1,7) → returns 1..6
     if (min == 1 && max == 7 && g_forceDice >= 1 && g_forceDice <= 6) {
-        LOGI("🎲 Dice intercepted → forcing %d", g_forceDice);
+        LOGI("DICE FORCED %d (req min=%d max=%d)", g_forceDice, min, max);
         return g_forceDice;
     }
-    return g_origRangeInt(min, max, method);
+    // Pass-through: use our own RNG
+    return randRange(min, max);
 }
 
-static float hook_RandomRangeFloat(float min, float max, const MethodInfo* method) {
+static float hook_RandomRangeFloat(float min, float max, const MethodInfo* /*method*/) {
     readConfig();
-    // Dice via float: some versions call Range(1f, 7f)
+    // Dice via float path: Range(1f, 7f)
     if (min >= 0.9f && min <= 1.1f && max >= 6.9f && max <= 7.1f &&
         g_forceDice >= 1 && g_forceDice <= 6) {
-        LOGI("🎲 Dice (float) intercepted → forcing %d", g_forceDice);
-        return static_cast<float>(g_forceDice);
+        LOGI("DICE(f) FORCED %d", g_forceDice);
+        return (float)g_forceDice;
     }
-    return g_origRangeFloat(min, max, method);
+    // Pass-through
+    if (max <= min) return min;
+    uint64_t r = xorshift64();
+    return min + (float)(r & 0xFFFFFF) / (float)0x1000000 * (max - min);
 }
 
-// ── Watchdog: re-applies patches every 500 ms ────────────────────────────────
+// ── Watchdog: re-apply patch every 200 ms ─────────────────────────────────────
 static void* watchdogThread(void*) {
-    LOGI("Watchdog started");
+    LOGI("Watchdog running");
     while (true) {
-        usleep(500000); // 500 ms
-        for (int i = 0; i < NUM_HOOKS; i++) {
-            if (g_sites[i].installed && !isPatchIntact(i)) {
-                LOGI("[slot %d] Patch was overwritten — re-applying", i);
-                void* hookFn = (i == 0)
-                    ? reinterpret_cast<void*>(hook_RandomRangeInt)
-                    : reinterpret_cast<void*>(hook_RandomRangeFloat);
-                writePatch(g_sites[i].target, hookFn);
-            }
+        usleep(200000); // 200 ms
+        if (g_targetInt && !isPatchIntact(g_targetInt)) {
+            LOGI("Patch was wiped — re-applying (int)");
+            applyPatch(g_targetInt);
+        }
+        if (g_targetFloat && !isPatchIntact(g_targetFloat)) {
+            LOGI("Patch was wiped — re-applying (float)");
+            applyPatch(g_targetFloat);
         }
     }
     return nullptr;
 }
 
-// ── Hook installer thread ─────────────────────────────────────────────────────
+// ── Hook installer ────────────────────────────────────────────────────────────
 static void* hookThread(void*) {
-    LOGI("Hook thread started — waiting for libil2cpp.so...");
+    LOGI("Hook thread: waiting for libil2cpp.so...");
+    initSeed();
 
-    void* il2cpp_handle = nullptr;
+    void* il2cpp = nullptr;
     for (int i = 0; i < 600; i++) {
-        il2cpp_handle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-        if (il2cpp_handle) break;
+        il2cpp = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+        if (il2cpp) break;
         usleep(100000);
     }
-    if (!il2cpp_handle) { LOGE("libil2cpp.so never appeared"); return nullptr; }
-    LOGI("libil2cpp.so handle: %p", il2cpp_handle);
+    if (!il2cpp) { LOGE("libil2cpp.so never loaded"); return nullptr; }
+    LOGI("libil2cpp.so: %p", il2cpp);
 
-#define RESOLVE(var, name) \
-    var = reinterpret_cast<decltype(var)>(dlsym(il2cpp_handle, name)); \
-    if (!var) { LOGE("dlsym failed: " name); return nullptr; }
+#define RESOLVE(var, sym) \
+    var = reinterpret_cast<decltype(var)>(dlsym(il2cpp, sym)); \
+    if (!var) { LOGE("dlsym missing: " sym); return nullptr; }
 
     RESOLVE(f_domain_get,            "il2cpp_domain_get")
     RESOLVE(f_domain_get_assemblies, "il2cpp_domain_get_assemblies")
@@ -227,83 +216,81 @@ static void* hookThread(void*) {
     RESOLVE(f_method_from_name,      "il2cpp_class_get_method_from_name")
 #undef RESOLVE
 
-    // Wait for IL2CPP domain
     Il2CppDomain* domain = nullptr;
     for (int i = 0; i < 300; i++) {
         domain = f_domain_get();
         if (domain) break;
         usleep(100000);
     }
-    if (!domain) { LOGE("IL2CPP domain never initialized"); return nullptr; }
-    LOGI("IL2CPP domain: %p", domain);
+    if (!domain) { LOGE("IL2CPP domain never ready"); return nullptr; }
 
-    // Walk assemblies to find UnityEngine.Random
     size_t count = 0;
     Il2CppAssembly** assemblies = f_domain_get_assemblies(domain, &count);
     LOGI("Assembly count: %zu", count);
 
-    Il2CppClass* randomClass = nullptr;
-    for (size_t i = 0; i < count && !randomClass; i++) {
+    Il2CppClass* randClass = nullptr;
+    for (size_t i = 0; i < count && !randClass; i++) {
         Il2CppImage* img = f_assembly_get_image(assemblies[i]);
-        if (!img) continue;
-        randomClass = f_class_from_name(img, "UnityEngine", "Random");
+        if (img) randClass = f_class_from_name(img, "UnityEngine", "Random");
     }
-    if (!randomClass) { LOGE("UnityEngine.Random class not found"); return nullptr; }
-    LOGI("UnityEngine.Random: %p", randomClass);
+    if (!randClass) { LOGE("UnityEngine.Random not found"); return nullptr; }
+    LOGI("UnityEngine.Random: %p", randClass);
 
-    // ── Slot 0: RandomRangeInt(int, int) ──────────────────────────────────────
-    const MethodInfo* mi_int = f_method_from_name(randomClass, "RandomRangeInt", 2);
+    // ── Slot 0: RandomRangeInt ────────────────────────────────────────────────
+    const MethodInfo* mi_int = f_method_from_name(randClass, "RandomRangeInt", 2);
     if (mi_int && mi_int->methodPointer) {
-        LOGI("RandomRangeInt ptr: %p", mi_int->methodPointer);
-        if (installHook(0, mi_int->methodPointer,
-                        reinterpret_cast<void*>(hook_RandomRangeInt))) {
-            // Point the trampoline so our original caller works
-            g_origRangeInt = reinterpret_cast<
-                int(*)(int32_t, int32_t, const MethodInfo*)>(g_trampolines[0]);
-            LOGI("✅ RandomRangeInt hooked. Trampoline: %p", g_origRangeInt);
-        }
-    } else {
-        LOGE("RandomRangeInt method/pointer not found");
-    }
+        g_targetInt = mi_int->methodPointer;
+        LOGI("RandomRangeInt at %p", g_targetInt);
 
-    // ── Slot 1: Range(float, float) ───────────────────────────────────────────
-    const MethodInfo* mi_float = f_method_from_name(randomClass, "Range", 2);
-    if (mi_float && mi_float->methodPointer) {
-        LOGI("Range(float) ptr: %p", mi_float->methodPointer);
-        if (installHook(1, mi_float->methodPointer,
-                        reinterpret_cast<void*>(hook_RandomRangeFloat))) {
-            g_origRangeFloat = reinterpret_cast<
-                float(*)(float, float, const MethodInfo*)>(g_trampolines[1]);
-            LOGI("✅ Range(float) hooked. Trampoline: %p", g_origRangeFloat);
-        }
-    } else {
-        LOGI("Range(float) not found — skipping (not fatal)");
-    }
+        buildPatch(reinterpret_cast<void*>(hook_RandomRangeInt));
 
-    // ── Patch the MethodInfo dispatch table too (belt + suspenders) ───────────
-    // Some IL2CPP call sites go through the table, others use the cached raw ptr.
-    // Patching both covers all paths.
-    if (mi_int) {
+        // Inline patch via /proc/self/mem
+        if (applyPatch(g_targetInt)) {
+            LOGI("RandomRangeInt inline-hooked (/proc/self/mem)");
+        }
+
+        // Belt+suspenders: also redirect the dispatch-table pointer
+        // so indirect call sites hit our hook immediately
         MethodInfo* mi_rw = const_cast<MethodInfo*>(mi_int);
-        uintptr_t addr = reinterpret_cast<uintptr_t>(mi_rw);
-        uintptr_t page = addr & ~(static_cast<uintptr_t>(getpagesize() - 1));
-        mprotect(reinterpret_cast<void*>(page), getpagesize() * 2, PROT_READ | PROT_WRITE);
+        uintptr_t page = (uintptr_t)mi_rw & ~(uintptr_t)(getpagesize()-1);
+        mprotect((void*)page, getpagesize()*2, PROT_READ|PROT_WRITE);
         mi_rw->methodPointer = reinterpret_cast<void*>(hook_RandomRangeInt);
-        __builtin___clear_cache(reinterpret_cast<char*>(mi_rw),
-                                reinterpret_cast<char*>(mi_rw) + sizeof(void*));
-        LOGI("✅ MethodInfo dispatch table also patched");
+        __builtin___clear_cache((char*)mi_rw, (char*)mi_rw + sizeof(void*));
+        LOGI("MethodInfo->methodPointer also redirected");
+
+    } else {
+        LOGE("RandomRangeInt MethodInfo not found");
     }
 
-    // ── Start watchdog ────────────────────────────────────────────────────────
+    // ── Slot 1: Range(float,float) ────────────────────────────────────────────
+    const MethodInfo* mi_f = f_method_from_name(randClass, "Range", 2);
+    if (mi_f && mi_f->methodPointer) {
+        g_targetFloat = mi_f->methodPointer;
+        LOGI("Range(float) at %p", g_targetFloat);
+
+        buildPatch(reinterpret_cast<void*>(hook_RandomRangeFloat));
+        applyPatch(g_targetFloat);
+
+        MethodInfo* mi_rw = const_cast<MethodInfo*>(mi_f);
+        uintptr_t page = (uintptr_t)mi_rw & ~(uintptr_t)(getpagesize()-1);
+        mprotect((void*)page, getpagesize()*2, PROT_READ|PROT_WRITE);
+        mi_rw->methodPointer = reinterpret_cast<void*>(hook_RandomRangeFloat);
+        __builtin___clear_cache((char*)mi_rw, (char*)mi_rw + sizeof(void*));
+        LOGI("Range(float) hooked");
+    } else {
+        LOGI("Range(float) not found — skipping");
+    }
+
+    // ── Watchdog ──────────────────────────────────────────────────────────────
     pthread_t wdTid;
     pthread_create(&wdTid, nullptr, watchdogThread, nullptr);
     pthread_detach(wdTid);
-    LOGI("Watchdog thread launched");
+    LOGI("All hooks installed. Watchdog running every 200ms.");
 
     return nullptr;
 }
 
-// ── Zygisk Module ─────────────────────────────────────────────────────────────
+// ── Zygisk module ─────────────────────────────────────────────────────────────
 class LudoRDModule : public ModuleBase {
 public:
     void onLoad(Api* api, JNIEnv* env) override {
@@ -314,8 +301,8 @@ public:
     void preAppSpecialize(AppSpecializeArgs* args) override {
         const char* proc = env->GetStringUTFChars(args->nice_name, nullptr);
         if (proc) {
-            isTarget = (strcmp(proc, "com.ludo.king") == 0);
-            if (isTarget) LOGI("Target process: %s", proc);
+            isTarget = strcmp(proc, "com.ludo.king") == 0;
+            if (isTarget) LOGI("Target: %s", proc);
             env->ReleaseStringUTFChars(args->nice_name, proc);
         }
         if (!isTarget) api->setOption(Option::DLCLOSE_MODULE_LIBRARY);
@@ -323,7 +310,7 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs*) override {
         if (!isTarget) return;
-        LOGI("postAppSpecialize — launching hook thread");
+        LOGI("postAppSpecialize — starting hook thread");
         pthread_t tid;
         pthread_create(&tid, nullptr, hookThread, nullptr);
         pthread_detach(tid);
