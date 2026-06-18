@@ -4,6 +4,7 @@ plugins {
 }
 
 android {
+    namespace "com.rohan.ludordclient"
     compileSdk 34
     defaultConfig {
         applicationId "com.rohan.ludordclient"
