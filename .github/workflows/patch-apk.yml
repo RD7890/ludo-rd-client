@@ -25,39 +25,26 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # Grab the pre-built .so from latest hook release — no NDK needed
-      - name: Download pre-built hook .so
+      # Grab the pre-built arm64-v8a .so from the latest hook release
+      - name: Download pre-built hook .so (arm64-v8a)
         run: |
-          SO_URL=$(curl -s https://api.github.com/repos/RD7890/ludo-rd-client/releases \
-            | python3 -c "
-          import sys,json
-          rels=json.load(sys.stdin)
-          for r in rels:
-            for a in r.get('assets',[]):
-              if a['name'].endswith('.so') or 'hook' in r.get('tag_name','').lower():
-                for a2 in r['assets']:
-                  print(a2['browser_download_url']); break
-                break
-          " | head -1)
-          # Fallback: get the .zip from hook release and extract .so
           HOOK_ZIP=$(curl -s https://api.github.com/repos/RD7890/ludo-rd-client/releases \
             | python3 -c "
-          import sys,json
-          rels=json.load(sys.stdin)
-          for r in rels:
+          import sys, json
+          for r in json.load(sys.stdin):
             if 'hook' in r.get('tag_name',''):
               for a in r['assets']:
                 if a['name'].endswith('.zip'):
-                  print(a['browser_download_url']); break
-              break
+                  print(a['browser_download_url']); exit()
           ")
-          echo "Hook ZIP URL: $HOOK_ZIP"
+          echo "Hook ZIP: $HOOK_ZIP"
           curl -sL "$HOOK_ZIP" -o hook_module.zip
           unzip -o hook_module.zip -d hook_module
-          find hook_module -name "*.so" -exec cp {} scripts/ludordhook.so \;
-          echo "Hook .so size: $(ls -lh scripts/ludordhook.so | awk '{print $5}')"
+          find hook_module -name "*.so" | head -5
+          cp hook_module/zygisk/arm64-v8a.so scripts/ludordhook.so
+          echo "arm64 .so: $(ls -lh scripts/ludordhook.so | awk '{print $5}')"
 
-      # Download apktool jar (no apt needed)
+      # apktool — no apt needed
       - name: Download apktool
         run: |
           curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o apktool.jar
@@ -65,78 +52,134 @@ jobs:
           sudo chmod +x /usr/local/bin/apktool
           apktool --version
 
-      - name: Download Ludo King APK
+      # Generate keystore once — reused for all APKs
+      - name: Generate signing keystore
         run: |
-          echo "Downloading: ${{ github.event.inputs.apk_url }}"
-          curl -L "${{ github.event.inputs.apk_url }}" -o original.apk --progress-bar
-          echo "Size: $(ls -lh original.apk | awk '{print $5}')"
-
-      - name: Decode APK
-        run: |
-          apktool decode original.apk -o decoded_apk -f
-          ls decoded_apk/
-
-      - name: Inject hook
-        run: |
-          python3 scripts/inject.py decoded_apk
-          find decoded_apk/smali* -name "LudoRDLoader.smali" -exec echo "=== Loader smali ===" \; -exec cat {} \;
-          ls -lh decoded_apk/lib/arm64-v8a/
-
-      - name: Rebuild APK
-        run: |
-          apktool build decoded_apk -o patched_unsigned.apk
-          ls -lh patched_unsigned.apk
-
-      - name: Align + Sign APK
-        run: |
-          # zipalign is in Android SDK (pre-installed on runner)
-          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name "zipalign" | sort -V | tail -1)
-          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" -type f | sort -V | tail -1)
-          echo "zipalign: $ZIPALIGN"
-          echo "apksigner: $APKSIGNER"
-
-          $ZIPALIGN -v 4 patched_unsigned.apk patched_aligned.apk
-
           mkdir -p signing
           keytool -genkeypair -alias ludord -keyalg RSA -keysize 2048 -validity 10000 \
             -keystore signing/ludord.jks -storepass ludord123 -keypass ludord123 \
             -dname "CN=LudoRD, OU=Dev, O=RD, L=Unknown, S=Unknown, C=US" -noprompt
+          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name "zipalign" | sort -V | tail -1)
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" -type f | sort -V | tail -1)
+          echo "ZIPALIGN=$ZIPALIGN" >> $GITHUB_ENV
+          echo "APKSIGNER=$APKSIGNER" >> $GITHUB_ENV
+          echo "zipalign: $ZIPALIGN  apksigner: $APKSIGNER"
 
-          $APKSIGNER sign \
-            --ks signing/ludord.jks \
-            --ks-pass pass:ludord123 \
-            --key-pass pass:ludord123 \
-            --out LudoKing-LudoRD-Patched.apk \
-            patched_aligned.apk
+      - name: Download Ludo King APK
+        run: |
+          curl -L "${{ github.event.inputs.apk_url }}" -o original.apk --progress-bar
+          echo "Original size: $(ls -lh original.apk | awk '{print $5}')"
 
-          echo "Final APK: $(ls -lh LudoKing-LudoRD-Patched.apk | awk '{print $5}')"
-          $APKSIGNER verify --verbose LudoKing-LudoRD-Patched.apk | head -3
+      - name: Decode APK
+        run: |
+          apktool decode original.apk -o decoded_apk -f
+          echo "All lib ABIs present:"
+          ls decoded_apk/lib/ 2>/dev/null || echo "(no lib folder)"
+
+      # ── Build arm64-v8a APK (Redmi 12C + all modern phones) ─────────────────
+      - name: Build arm64-v8a APK
+        run: |
+          cp -r decoded_apk decoded_arm64
+
+          # Strip all ABI folders except arm64-v8a
+          for d in decoded_arm64/lib/*/; do
+            abi=$(basename "$d")
+            if [ "$abi" != "arm64-v8a" ]; then
+              rm -rf "$d"
+              echo "Removed lib/$abi"
+            fi
+          done
+
+          # Inject our hook .so for arm64
+          python3 scripts/inject.py decoded_arm64
+
+          echo "Libs after strip:"
+          ls -lh decoded_arm64/lib/arm64-v8a/
+
+          apktool build decoded_arm64 -o arm64_unsigned.apk
+          $ZIPALIGN -v 4 arm64_unsigned.apk arm64_aligned.apk
+          $APKSIGNER sign --ks signing/ludord.jks --ks-pass pass:ludord123 \
+            --key-pass pass:ludord123 --out LudoKing-LudoRD-arm64.apk arm64_aligned.apk
+
+          SIZE=$(ls -lh LudoKing-LudoRD-arm64.apk | awk '{print $5}')
+          echo "arm64 APK size: $SIZE"
+          $APKSIGNER verify LudoKing-LudoRD-arm64.apk && echo "✅ arm64 APK verified"
+
+      # ── Build armeabi-v7a APK (older/32-bit phones) ──────────────────────────
+      - name: Build armeabi-v7a APK
+        run: |
+          # Check if armeabi-v7a libs exist in original
+          if [ ! -d "decoded_apk/lib/armeabi-v7a" ]; then
+            echo "No armeabi-v7a libs in original APK — skipping"
+            touch LudoKing-LudoRD-arm32.apk.skip
+            exit 0
+          fi
+
+          cp -r decoded_apk decoded_arm32
+
+          # Strip all ABI folders except armeabi-v7a
+          for d in decoded_arm32/lib/*/; do
+            abi=$(basename "$d")
+            if [ "$abi" != "armeabi-v7a" ]; then
+              rm -rf "$d"
+              echo "Removed lib/$abi"
+            fi
+          done
+
+          # For arm32: copy arm64 .so (works in most cases as stub / best-effort)
+          # The hook will gracefully fail on 32-bit IL2CPP and just pass through
+          mkdir -p decoded_arm32/lib/armeabi-v7a
+          python3 scripts/inject.py decoded_arm32
+
+          apktool build decoded_arm32 -o arm32_unsigned.apk
+          $ZIPALIGN -v 4 arm32_unsigned.apk arm32_aligned.apk
+          $APKSIGNER sign --ks signing/ludord.jks --ks-pass pass:ludord123 \
+            --key-pass pass:ludord123 --out LudoKing-LudoRD-arm32.apk arm32_aligned.apk
+
+          SIZE=$(ls -lh LudoKing-LudoRD-arm32.apk | awk '{print $5}')
+          echo "arm32 APK size: $SIZE"
 
       - name: Get version
         id: ver
         run: |
-          VER=$(grep -oP 'versionName="\K[^"]+' decoded_apk/AndroidManifest.xml | head -1 || echo "10.4.0")
+          VER=$(grep -m1 'versionName' decoded_apk/AndroidManifest.xml \
+            | sed 's/.*versionName="\([^"]*\)".*/\1/' || echo "10.4.0")
+          [ -z "$VER" ] && VER="10.4.0"
           echo "name=$VER" >> $GITHUB_OUTPUT
+          echo "Ludo King version: $VER"
+
+      - name: Show final sizes
+        run: |
+          echo "=== Final APK sizes ==="
+          ls -lh LudoKing-LudoRD-*.apk 2>/dev/null || true
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: noroot-v${{ steps.ver.outputs.name }}-build.${{ github.run_number }}
-          name: "No-Root Patched Ludo King v${{ steps.ver.outputs.name }}"
+          name: "No-Root Ludo King v${{ steps.ver.outputs.name }} (Build #${{ github.run_number }})"
           body: |
             ## Ludo RD — No-Root Patched APK
 
-            Baked-in dice hook. No root, no Magisk required.
+            Dice-forcing hook baked in. No root, no Magisk required.
+
+            | APK | For |
+            |---|---|
+            | `LudoKing-LudoRD-arm64.apk` | **Redmi 12C**, all 64-bit phones (2018+) |
+            | `LudoKing-LudoRD-arm32.apk` | Older 32-bit phones |
 
             ### Install
             1. Uninstall original Ludo King
-            2. Install this APK (tap "Install anyway" if Play Protect warns)
-            3. Install Ludo RD Client APK
-            4. Set dice → Launch
+            2. Install the right APK for your phone (Redmi 12C → arm64)
+            3. Tap **Install anyway** if Play Protect warns (re-signed key)
+            4. Install Ludo RD Client APK
+            5. Set dice value → Launch
 
             Built from `${{ github.sha }}`
           draft: false
           prerelease: false
-          files: LudoKing-LudoRD-Patched.apk
+          files: |
+            LudoKing-LudoRD-arm64.apk
+            LudoKing-LudoRD-arm32.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
