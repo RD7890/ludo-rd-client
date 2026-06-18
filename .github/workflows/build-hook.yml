@@ -32,33 +32,36 @@ jobs:
           java-version: '17'
           distribution: 'adopt'
 
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build unzip wget
+
       - name: Setup Android NDK r27
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -O /tmp/ndk.zip
           unzip -q /tmp/ndk.zip -d /opt
-          echo "NDK_PATH=/opt/android-ndk-r27c" >> $GITHUB_ENV
-          echo "/opt/android-ndk-r27c" >> $GITHUB_PATH
+          echo "NDK_HOME=/opt/android-ndk-r27c" >> $GITHUB_ENV
 
       - name: Download Zygisk API header
         run: |
           mkdir -p hook/src
           curl -sL https://raw.githubusercontent.com/topjohnwu/zygisk-api/master/zygisk.hpp \
             -o hook/src/zygisk.hpp
-          echo "Zygisk header downloaded ($(wc -l < hook/src/zygisk.hpp) lines)"
+          echo "Zygisk header: $(wc -l < hook/src/zygisk.hpp) lines"
 
       - name: Build arm64-v8a hook .so
         run: |
           mkdir -p hook/build
-          /opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/cmake \
+          cmake \
             -S hook \
             -B hook/build \
-            -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk-r27c/build/cmake/android.toolchain.cmake \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
             -G Ninja
-          /opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/cmake \
-            --build hook/build --config Release
+          cmake --build hook/build --config Release
           echo "Built: $(ls -lh hook/build/libludordhook.so)"
 
       - name: Package Zygisk module ZIP
