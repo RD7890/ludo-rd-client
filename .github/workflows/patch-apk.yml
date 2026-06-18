@@ -1,0 +1,159 @@
+name: Patch Ludo King APK (No-Root)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct download URL of the original Ludo King APK'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    name: Build Hook + Patch APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake ninja-build unzip wget python3 zipalign
+
+      # ── Build the hook .so ──────────────────────────────────────────────────
+      - name: Setup Android NDK r27c
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "NDK_HOME=/opt/android-ndk-r27c" >> $GITHUB_ENV
+
+      - name: Build arm64-v8a hook .so
+        run: |
+          mkdir -p hook/build
+          cmake \
+            -S hook \
+            -B hook/build \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+          cmake --build hook/build --config Release
+          ls -lh hook/build/libludordhook.so
+          cp hook/build/libludordhook.so scripts/ludordhook.so
+
+      # ── Download + patch the APK ────────────────────────────────────────────
+      - name: Download Ludo King APK
+        run: |
+          echo "Downloading APK from: ${{ github.event.inputs.apk_url }}"
+          wget -q "${{ github.event.inputs.apk_url }}" -O original.apk
+          echo "APK size: $(ls -lh original.apk | awk '{print $5}')"
+          file original.apk
+
+      - name: Download apktool
+        run: |
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+          echo '#!/bin/bash' > /usr/local/bin/apktool
+          echo 'java -jar '"$(pwd)/apktool.jar"' "$@"' >> /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Decode APK
+        run: |
+          apktool decode original.apk -o decoded_apk --no-res -f
+          echo "Decoded files:"
+          ls decoded_apk/
+
+      - name: Inject hook
+        run: |
+          python3 scripts/inject.py decoded_apk
+          echo "Smali after injection:"
+          find decoded_apk/smali* -name "LudoRDLoader.smali" -exec cat {} \;
+          echo "Lib after injection:"
+          ls -lh decoded_apk/lib/arm64-v8a/
+
+      - name: Rebuild APK
+        run: |
+          apktool build decoded_apk -o patched_unsigned.apk
+          echo "Unsigned APK: $(ls -lh patched_unsigned.apk | awk '{print $5}')"
+
+      - name: Align APK
+        run: |
+          zipalign -v 4 patched_unsigned.apk patched_aligned.apk
+          echo "Aligned APK: $(ls -lh patched_aligned.apk | awk '{print $5}')"
+
+      - name: Generate signing keystore
+        run: |
+          mkdir -p signing
+          keytool -genkeypair \
+            -alias ludord \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -keystore signing/ludord.jks \
+            -storepass ludord123 \
+            -keypass ludord123 \
+            -dname "CN=LudoRD, OU=Dev, O=RD, L=Unknown, S=Unknown, C=US"
+
+      - name: Sign APK
+        run: |
+          $JAVA_HOME/bin/apksigner sign \
+            --ks signing/ludord.jks \
+            --ks-pass pass:ludord123 \
+            --key-pass pass:ludord123 \
+            --out LudoKing-LudoRD-Patched.apk \
+            patched_aligned.apk
+          echo "Signed APK: $(ls -lh LudoKing-LudoRD-Patched.apk | awk '{print $5}')"
+          $JAVA_HOME/bin/apksigner verify --verbose LudoKing-LudoRD-Patched.apk | head -5
+
+      - name: Get Ludo King version from manifest
+        id: version
+        run: |
+          VER=$(grep -oP 'versionName="\K[^"]+' decoded_apk/AndroidManifest.xml | head -1 || echo "unknown")
+          echo "name=$VER" >> $GITHUB_OUTPUT
+          echo "Ludo King version: $VER"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: noroot-v${{ steps.version.outputs.name }}-build.${{ github.run_number }}
+          name: "No-Root Patched APK — Ludo King v${{ steps.version.outputs.name }}"
+          body: |
+            ## Ludo RD — No-Root Patched Ludo King APK
+
+            This is a **modified Ludo King APK** with the LudoRD dice-forcing hook baked in.
+            No root, no Magisk, no Zygisk required.
+
+            ### Install
+            1. **Uninstall** the original Ludo King from your phone first
+            2. Install **LudoKing-LudoRD-Patched.apk**
+            3. Install the **Ludo RD Client APK** (the controller UI)
+            4. Open Ludo RD Client → set dice value → tap Launch
+
+            ### How it works
+            - Our native library (`libludordhook.so`) is embedded directly in the APK
+            - It loads via `System.loadLibrary` before any game code runs
+            - Patches `UnityEngine.Random.RandomRangeInt` in-process using `/proc/self/mem`
+            - Watchdog thread re-applies the patch every 200ms permanently
+
+            ### Note
+            - Since this is re-signed with a different key, Play Protect may warn you — tap **Install anyway**
+            - Original Ludo King must be uninstalled first (different signature)
+            - Built from commit: `${{ github.sha }}`
+          draft: false
+          prerelease: false
+          files: LudoKing-LudoRD-Patched.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
