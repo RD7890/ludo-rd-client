@@ -109,14 +109,17 @@ jobs:
 
       - name: Sign APK
         run: |
-          $JAVA_HOME/bin/apksigner sign \
+          # Find apksigner from pre-installed Android SDK build-tools
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" -type f | sort -V | tail -1)
+          echo "Using apksigner: $APKSIGNER"
+          $APKSIGNER sign \
             --ks signing/ludord.jks \
             --ks-pass pass:ludord123 \
             --key-pass pass:ludord123 \
             --out LudoKing-LudoRD-Patched.apk \
             patched_aligned.apk
           echo "Signed APK: $(ls -lh LudoKing-LudoRD-Patched.apk | awk '{print $5}')"
-          $JAVA_HOME/bin/apksigner verify --verbose LudoKing-LudoRD-Patched.apk | head -5
+          $APKSIGNER verify --verbose LudoKing-LudoRD-Patched.apk | head -5
 
       - name: Get Ludo King version from manifest
         id: version
