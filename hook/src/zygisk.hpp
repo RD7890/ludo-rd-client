@@ -197,6 +197,7 @@ private:
 // Register a class as a Zygisk module
 
 #define REGISTER_ZYGISK_MODULE(clazz) \
+extern "C" __attribute__((visibility("default"))) __attribute__((used)) \
 void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) { \
     zygisk::internal::entry_impl<clazz>(table, env);                        \
 }
@@ -212,6 +213,7 @@ void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) { \
 // Be aware of race conditions if you have a globally shared resource.
 
 #define REGISTER_ZYGISK_COMPANION(func) \
+extern "C" __attribute__((visibility("default"))) __attribute__((used)) \
 void zygisk_companion_entry(int client) { func(client); }
 
 /************************************************************************************
@@ -287,8 +289,8 @@ bool Api::pltHookCommit() {
 
 } // namespace zygisk
 
-[[gnu::visibility("default")]] [[gnu::used]]
-extern "C" void zygisk_module_entry(zygisk::internal::api_table *, JNIEnv *);
+extern "C" __attribute__((visibility("default"))) __attribute__((used))
+void zygisk_module_entry(zygisk::internal::api_table *, JNIEnv *);
 
-[[gnu::visibility("default")]] [[gnu::used]]
-extern "C" void zygisk_companion_entry(int);
+extern "C" __attribute__((visibility("default"))) __attribute__((used))
+void zygisk_companion_entry(int);
